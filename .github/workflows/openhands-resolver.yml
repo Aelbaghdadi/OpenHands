@@ -92,6 +92,7 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+
       - name: Upgrade pip
         run: |
           python -m pip install --upgrade pip
@@ -240,6 +241,17 @@ jobs:
               await exec.exec("pip install -r /tmp/requirements.txt");
             }
 
+      - name: Ensure /usr/local/bin is on PATH
+        run: |
+          echo "/usr/local/bin" >> $GITHUB_PATH
+          export PATH="/usr/local/bin:$PATH"
+          /usr/local/bin/node -v || true
+
+      - name: Clean previous resolver output
+        run: |
+          rm -rf /tmp/output || true
+          rm -f /tmp/pr_result.txt /tmp/pr_number.txt /tmp/branch_result.txt /tmp/branch_name.txt || true
+
       - name: Attempt to resolve issue
         env:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || github.token }}
@@ -262,7 +274,7 @@ jobs:
       - name: Check resolution result
         id: check_result
         run: |
-          if cd /tmp && grep -q '"success":true' output/output.jsonl; then
+          if [ -f /tmp/output/output.jsonl ] && grep -q '"success":true' /tmp/output/output.jsonl; then
             echo "RESOLUTION_SUCCESS=true" >> $GITHUB_OUTPUT
           else
             echo "RESOLUTION_SUCCESS=false" >> $GITHUB_OUTPUT
@@ -276,6 +288,28 @@ jobs:
           path: /tmp/output/output.jsonl
           retention-days: 30 # Keep the artifact for 30 days
 
+      - name: Ensure patch exists before creating PR/branch
+        id: has_patch
+        run: |
+          python - <<'PY'
+          import json, pathlib, os
+          p = pathlib.Path("/tmp/output/output.jsonl")
+          has_patch = False
+
+          if p.exists():
+            last = None
+            for line in p.read_text().splitlines():
+              if line.strip():
+                try:
+                  last = json.loads(line)
+                except Exception:
+                  pass
+            has_patch = bool((last or {}).get("git_patch"))
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+            f.write(f"HAS_PATCH={'true' if has_patch else 'false'}\n")
+          PY
+
       - name: Create draft PR or push branch
         if: always() # Create PR or branch even if the previous steps fail
         env:
@@ -288,6 +322,12 @@ jobs:
           LLM_API_VERSION: ${{ inputs.LLM_API_VERSION }}
           PYTHONPATH: ""
         run: |
+          # Guard: if no git_patch, don't call send_pull_request (prevents crash)
+          if [ "${{ steps.has_patch.outputs.HAS_PATCH }}" != "true" ]; then
+            echo "No changes to commit for issue #${{ env.ISSUE_NUMBER }}. Skipping commit." | tee /tmp/pr_result.txt
+            exit 0
+          fi
+
           if [ "${{ steps.check_result.outputs.RESOLUTION_SUCCESS }}" == "true" ]; then
             cd /tmp && python -m openhands.resolver.send_pull_request \
               --issue-number ${{ env.ISSUE_NUMBER }} \
@@ -368,7 +408,6 @@ jobs:
             } catch (error) {
               console.error('Error reading file:', error);
             }
-
 
             try {
               if (!success){
